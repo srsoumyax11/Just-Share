@@ -22,6 +22,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// uploadBufferPool is a sync.Pool that recycles byte slices of size 256KB
+// we allocate 256KB first time and reuse it when the ptr is returned to the pool
+var uploadBufferPool = sync.Pool{
+	New: func() interface{} {
+		buffer := make([]byte, 256*1024) // 256KB buffer optimized for gigabit LAN
+		return &buffer
+	},
+}
+
 type Server struct {
 	Hub            *hub.Hub
 	Port           string
@@ -325,10 +334,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Stream directly from Network -> Disk
-			// This is "chunk-wise". It reads a small buffer from net, writes to disk.
-			// It does NOT load the whole file into RAM.
-			size, err := io.Copy(dst, part)
+			// Stream directly from Network -> Disk with optimized pooled buffer
+			// 256KB buffer over default 32KB
+			bufferPtr := uploadBufferPool.Get().(*[]byte)
+			defer uploadBufferPool.Put(bufferPtr)
+			clear(*bufferPtr) // Clear the buffer before using it
+
+			size, err := io.CopyBuffer(dst, part, *bufferPtr)
 			dst.Close()
 
 			if err != nil {
