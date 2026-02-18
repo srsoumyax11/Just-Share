@@ -2,6 +2,8 @@ package server
 
 import (
 	"Bee/internal/hub"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,17 +32,23 @@ var uploadBufferPool = sync.Pool{
 }
 
 type Server struct {
-	Hub        *hub.Hub
-	Port       string
-	Pin        string
-	FrontendFS http.FileSystem // Optional embedded frontend filesystem
+	Hub            *hub.Hub
+	Port           string
+	Pin            string
+	FrontendFS     http.FileSystem // Optional embedded frontend filesystem
+	activeUploads  sync.WaitGroup  // Security: Track uploads for graceful shutdown (CWE-404)
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 func NewServer(port, pin string) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		Hub:  hub.NewHub(),
-		Port: port,
-		Pin:  pin,
+		Hub:            hub.NewHub(),
+		Port:           port,
+		Pin:            pin,
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 
@@ -56,7 +65,7 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-func (s *Server) Start() {
+func (s *Server) Start(openBrowser bool) {
 	// Ensure uploads directory exists
 	if _, err := os.Stat("uploads"); os.IsNotExist(err) {
 		os.Mkdir("uploads", 0755)
@@ -66,12 +75,13 @@ func (s *Server) Start() {
 
 	// Upload Handler
 	http.HandleFunc("/upload", s.handleUpload)
-	// Serve Uploaded Files
-	// Using StripPrefix so /upload/filename.ext maps to uploads/filename.ext
-	http.Handle("/upload/", http.StripPrefix("/upload/", http.FileServer(http.Dir("uploads"))))
+	// Serve Uploaded Files with security headers
+	http.HandleFunc("/upload/", s.handleFileDownload)
 
 	// List Files Handler
 	http.HandleFunc("/files", s.handleListFiles)
+	// Delete File Handler - Security: File deletion capability (CWE-459)
+	http.HandleFunc("/delete/", s.handleDeleteFile)
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// Validate PIN
@@ -121,10 +131,12 @@ func (s *Server) Start() {
 
 		// Handle incoming messages
 		go func() {
+			// Security: Proper resource cleanup to prevent leaks (CWE-404)
 			defer func() {
 				ticker.Stop()
 				s.Hub.Unregister <- client
 				conn.Close()
+				log.Printf("[CLEANUP] WebSocket connection closed: %s", client.Name)
 			}()
 			for {
 				_, _, err := conn.ReadMessage()
@@ -187,7 +199,10 @@ func (s *Server) Start() {
 	fmt.Println(" Share this URL and PIN with others on your Wi-Fi")
 	fmt.Println("=================================================")
 
-	// openBrowser(fmt.Sprintf("http://localhost:%s", s.Port))
+	// Security: Browser auto-open configuration (Low severity fix)
+	if openBrowser {
+		openBrowserFunc(fmt.Sprintf("http://localhost:%s", s.Port))
+	}
 
 	// Handle Graceful Shutdown
 	stop := make(chan os.Signal, 1)
@@ -206,7 +221,22 @@ func (s *Server) Start() {
 
 	<-stop
 	fmt.Println("\nShutting down server...")
-	// Cleanup if needed
+	s.shutdownCancel()
+	
+	// Security: Graceful shutdown - wait for active uploads (CWE-404)
+	done := make(chan struct{})
+	go func() {
+		s.activeUploads.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		log.Println("[SHUTDOWN] All uploads completed gracefully")
+	case <-time.After(30 * time.Second):
+		log.Println("[SHUTDOWN] Timeout reached, forcing exit")
+	}
+	
 	os.Exit(0)
 }
 
@@ -228,11 +258,27 @@ func extractIP(remoteAddr string) string {
 	return host
 }
 
+// Security: Add security headers middleware
+func (s *Server) setSecurityHeaders(w http.ResponseWriter) {
+	// Security: CSP to prevent XSS (CWE-1021)
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:")
+	// Security: Additional security headers (CWE-693)
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+}
+
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	s.setSecurityHeaders(w)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	if r.Method == "OPTIONS" {
 		return
 	}
+	
+	// Security: Track active uploads for graceful shutdown (CWE-404)
+	s.activeUploads.Add(1)
+	defer s.activeUploads.Done()
 
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -271,16 +317,20 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 
 			savePath := filepath.Join("uploads", filename)
-			// Ensure unique name
+			// Ensure unique name with crypto-random prefix
 			if _, err := os.Stat(savePath); err == nil {
-				filename = fmt.Sprintf("%d_%s", time.Now().Unix(), filename)
+				// Security: Use crypto-random prefix instead of predictable timestamp (CWE-330)
+				randomBytes := make([]byte, 8)
+				rand.Read(randomBytes)
+				filename = fmt.Sprintf("%x_%s", randomBytes, filename)
 				savePath = filepath.Join("uploads", filename)
 			}
 
 			dst, err := os.Create(savePath)
 			if err != nil {
-				log.Printf("Error creating file: %v", err)
-				http.Error(w, "Error saving file", http.StatusInternalServerError)
+				// Security: Generic error message to prevent info disclosure (CWE-209)
+				log.Printf("[ERROR] File creation failed: %v", err)
+				http.Error(w, "Upload failed", http.StatusInternalServerError)
 				return
 			}
 
@@ -294,12 +344,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			dst.Close()
 
 			if err != nil {
-				log.Printf("Error copying file: %v", err)
-				http.Error(w, "Error saving file", http.StatusInternalServerError)
+				// Security: Generic error message (CWE-209)
+				log.Printf("[ERROR] File copy failed: %v", err)
+				http.Error(w, "Upload failed", http.StatusInternalServerError)
 				return
 			}
 
-			log.Printf("File received: %s (%d bytes)", filename, size)
+			// Security: Audit log for file operations (CWE-778)
+			log.Printf("[AUDIT] File uploaded: %s | Size: %d bytes | IP: %s", filename, size, extractIP(r.RemoteAddr))
 		}
 	}
 
@@ -311,12 +363,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	s.setSecurityHeaders(w)
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 
 	files, err := s.listFiles()
 	if err != nil {
-		http.Error(w, "Could not list files", http.StatusInternalServerError)
+		// Security: Generic error message (CWE-209)
+		log.Printf("[ERROR] File listing failed: %v", err)
+		http.Error(w, "Failed to list files", http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(files)
@@ -359,7 +414,47 @@ func (s *Server) broadcastFileList() {
 	// The previous fix ensures Hub.Run uses `sendToAll`.
 }
 
-func openBrowser(url string) {
+// Security: File download handler with audit logging (CWE-778)
+func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
+	s.setSecurityHeaders(w)
+	filename := strings.TrimPrefix(r.URL.Path, "/upload/")
+	filePath := filepath.Join("uploads", filepath.Base(filename))
+	
+	// Security: Audit log for downloads (CWE-778)
+	log.Printf("[AUDIT] File download: %s | IP: %s", filename, extractIP(r.RemoteAddr))
+	
+	http.ServeFile(w, r, filePath)
+}
+
+// Security: File deletion handler (CWE-459)
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	s.setSecurityHeaders(w)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	
+	if r.Method != "DELETE" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	filename := strings.TrimPrefix(r.URL.Path, "/delete/")
+	filePath := filepath.Join("uploads", filepath.Base(filename))
+	
+	// Security: Audit log before deletion (CWE-778)
+	log.Printf("[AUDIT] File deletion requested: %s | IP: %s", filename, extractIP(r.RemoteAddr))
+	
+	if err := os.Remove(filePath); err != nil {
+		log.Printf("[ERROR] File deletion failed: %v", err)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	
+	log.Printf("[AUDIT] File deleted: %s", filename)
+	s.broadcastFileList()
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("File deleted"))
+}
+
+func openBrowserFunc(url string) {
 	var err error
 	switch runtime.GOOS {
 	case "linux":
